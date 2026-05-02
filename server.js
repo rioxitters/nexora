@@ -20,7 +20,8 @@ if (!fs.existsSync(uploadDir)) {
 
 // ===== CORS Configuration =====
 const allowedOrigins = [
-    'https://nexoracheats.infinityfree.me', // আপনার ফ্রন্টএন্ড ডোমেইন
+    'https://nexoracheats.infinityfree.me',
+    'https://nexoracheat.netlify.app',// আপনার ফ্রন্টএন্ড ডোমেইন
     'http://localhost:3000',               // লোকাল ডেভেলপমেন্টের জন্য
     'http://127.0.0.1:3000'
 ];
