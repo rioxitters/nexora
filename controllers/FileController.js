@@ -1,27 +1,88 @@
-const db = require('../database/db');
+const storage = require('../storage');
 const discordBot = require('../services/DiscordBot');
 const fs = require('fs').promises;
 const path = require('path');
 
-exports.uploadFile = async (req, res) => {
-    const connection = await db.getConnection();
-    
-    try {
-        await connection.beginTransaction();
+const uploadsDir = path.join(__dirname, '..', '..', 'uploads');
 
-        if (!req.file) {
-            return res.status(400).json({ message: 'No file uploaded' });
-        }
+async function ensureDataFiles() {
+    await storage.readJSON('files.json');
+    await storage.readJSON('file_versions.json');
+    await storage.readJSON('activities.json');
+}
+
+function now() { return new Date().toISOString(); }
+
+async function addActivity(entry) {
+    const activities = await storage.readJSON('activities.json');
+    activities.push(entry);
+    await storage.writeJSON('activities.json', activities);
+}
+
+exports.uploadFile = async (req, res) => {
+    try {
+        await ensureDataFiles();
+
+        if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
         const { originalname, filename, path: filePath, size, mimetype } = req.file;
-        
-        // Get metadata from request body
         const title = req.body.title || originalname;
         const description = req.body.description || '';
         const category = req.body.category || '';
         const tags = req.body.tags || '';
-        
-        // Get bot message data from request body
+
+        const files = await storage.readJSON('files.json');
+        const versions = await storage.readJSON('file_versions.json');
+
+        const fileId = storage.generateId('f_');
+        const fileRecord = {
+            id: fileId,
+            user_id: req.userId,
+            original_name: originalname,
+            title,
+            description,
+            category,
+            tags,
+            current_version: 1,
+            is_deleted: false,
+            created_at: now(),
+            updated_at: now()
+        };
+        files.push(fileRecord);
+
+        versions.push({
+            id: storage.generateId('v_'),
+            file_id: fileId,
+            version_number: 1,
+            filename,
+            original_name: originalname,
+            file_path: filePath,
+            file_size: size,
+            mime_type: mimetype,
+            discord_message_id: null,
+            uploaded_at: now()
+        });
+
+        await storage.writeJSON('files.json', files);
+        await storage.writeJSON('file_versions.json', versions);
+
+        await addActivity({
+            id: storage.generateId('a_'),
+            user_id: req.userId,
+            username: req.user?.username || 'admin',
+            file_id: fileId,
+            file_name: originalname,
+            action: 'upload',
+            details: `File uploaded: ${title}`,
+            created_at: now()
+        });
+
+        // Try sending to Discord if configured in users.json
+        const users = await storage.readJSON('users.json');
+        const user = users.find(u => u.id === req.userId) || {};
+        let discordSent = false;
+        let discordError = null;
+
         const botData = {
             botTitle: req.body.botTitle || '',
             botSubtitle: req.body.botSubtitle || '',
@@ -30,195 +91,103 @@ exports.uploadFile = async (req, res) => {
             botLinks: req.body.botLinks || '',
             botColor: req.body.botColor || '#5865F2'
         };
-        
-        console.log('📁 Uploading file...');
-        console.log('   File:', originalname);
-        console.log('   Title:', title);
-        console.log('   Size:', (size / 1024 / 1024).toFixed(2), 'MB');
-        console.log('   Bot Title:', botData.botTitle || 'None');
-        console.log('   Has Bot Content:', botData.botContent ? 'Yes' : 'No');
-        console.log('   Has Bot Links:', botData.botLinks ? 'Yes' : 'No');
-        
-        // Verify file exists and is readable
-        try {
-            await fs.access(filePath, fs.constants.R_OK);
-        } catch (err) {
-            return res.status(400).json({ message: 'Uploaded file not accessible' });
-        }
-        
-        // Insert into files table with metadata
-        const [fileResult] = await connection.execute(
-            `INSERT INTO files (user_id, original_name, title, description, category, tags, current_version) 
-             VALUES (?, ?, ?, ?, ?, ?, 1)`,
-            [req.userId, originalname, title, description, category, tags]
-        );
 
-        const fileId = fileResult.insertId;
+        if (user.discord_configured && user.discord_channel_id) {
+            try {
+                const hasBotMessage = botData.botTitle || botData.botContent || botData.botLinks || botData.botSubtitle || botData.botStatus;
+                let result;
+                if (hasBotMessage) {
+                    result = await discordBot.sendPlainTextMessage(user.discord_channel_id, filePath, originalname, botData);
+                } else {
+                    result = await discordBot.sendFileWithDetails(user.discord_channel_id, filePath, originalname, title, description, category, tags, 1, 'new');
+                }
 
-        // Insert file version
-        await connection.execute(
-            `INSERT INTO file_versions (file_id, version_number, filename, original_name, file_path, file_size, mime_type) 
-             VALUES (?, 1, ?, ?, ?, ?, ?)`,
-            [fileId, filename, originalname, filePath, size, mimetype]
-        );
+                if (result.success) {
+                    // update version record
+                    const v = versions.find(v => v.file_id === fileId && v.version_number === 1);
+                    if (v) v.discord_message_id = result.messageId;
+                    await storage.writeJSON('file_versions.json', versions);
 
-        // Log activity
-        await connection.execute(
-            `INSERT INTO activities (user_id, username, file_id, file_name, action, details) 
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [req.userId, req.user.username, fileId, originalname, 'upload', `File uploaded: ${title}`]
-        );
+                    await addActivity({
+                        id: storage.generateId('a_'),
+                        user_id: req.userId,
+                        username: req.user?.username || 'admin',
+                        file_id: fileId,
+                        file_name: originalname,
+                        action: 'sync',
+                        details: `File sent to Discord`,
+                        created_at: now()
+                    });
 
-        await connection.commit();
-        
-        console.log('✅ File saved to database:', title);
-
-        // Try to send to Discord
-        let discordSent = false;
-        let discordError = null;
-
-        if (req.user.discord_configured === 1 && req.user.discord_channel_id) {
-            console.log('📤 Sending to Discord...');
-            
-            let result;
-            
-            // 🔥 CHECK: Bot Message Tab e kichu likhse kina
-            const hasBotMessage = botData.botTitle || botData.botContent || botData.botLinks || botData.botSubtitle || botData.botStatus;
-            
-            if (hasBotMessage) {
-                // USE PLAIN TEXT - NO EMBED
-                console.log('   📝 Sending as PLAIN TEXT (no embed)...');
-                result = await discordBot.sendPlainTextMessage(
-                    req.user.discord_channel_id,
-                    filePath,
-                    originalname,
-                    botData
-                );
-            } else {
-                // USE EMBED with file details
-                console.log('   📦 Sending as EMBED with details...');
-                result = await discordBot.sendFileWithDetails(
-                    req.user.discord_channel_id,
-                    filePath,
-                    originalname,
-                    title,
-                    description,
-                    category,
-                    tags,
-                    1,
-                    'new'
-                );
-            }
-            
-            if (result.success) {
-                await connection.execute(
-                    'UPDATE file_versions SET discord_message_id = ? WHERE file_id = ? AND version_number = 1',
-                    [result.messageId, fileId]
-                );
-                
-                const syncType = hasBotMessage ? 'plain text' : 'embed';
-                await connection.execute(
-                    `INSERT INTO activities (user_id, username, file_id, file_name, action, details) 
-                     VALUES (?, ?, ?, ?, ?, ?)`,
-                    [req.userId, req.user.username, fileId, originalname, 'sync', `File sent to Discord as ${syncType}`]
-                );
-                
-                console.log('✅ Sent to Discord successfully');
-                discordSent = true;
-            } else {
-                console.log('⚠️ Discord send failed:', result.error);
-                discordError = result.error;
+                    discordSent = true;
+                } else {
+                    discordError = result.error || 'Discord error';
+                }
+            } catch (e) {
+                discordError = e.message || 'Discord send failed';
             }
         }
 
-        // Send success response
         res.status(201).json({
             message: 'File uploaded successfully' + (discordSent ? ' and sent to Discord' : (discordError ? ' but Discord sync failed' : '')),
             file: {
                 id: fileId,
                 name: originalname,
-                title: title,
-                description: description,
-                category: category,
-                tags: tags,
+                title,
+                description,
+                category,
+                tags,
                 version: 1,
-                size: size,
-                discordSent: discordSent,
-                discordError: discordError
+                size,
+                discordSent,
+                discordError
             }
         });
-
     } catch (error) {
-        await connection.rollback();
         console.error('❌ Upload error:', error);
-        
-        // Clean up uploaded file on error
+        // try cleanup
         if (req.file && req.file.path) {
-            try {
-                await fs.unlink(req.file.path);
-                console.log('🧹 Cleaned up file:', req.file.path);
-            } catch (unlinkError) {
-                console.error('Error cleaning up file:', unlinkError);
-            }
+            try { await fs.unlink(req.file.path); } catch (e) {}
         }
-        
-        // Check if headers already sent
-        if (!res.headersSent) {
-            res.status(500).json({ 
-                message: 'Error uploading file. Please try again.',
-                error: process.env.NODE_ENV === 'development' ? error.message : undefined
-            });
-        }
-    } finally {
-        connection.release();
+        if (!res.headersSent) res.status(500).json({ message: 'Error uploading file' });
     }
 };
 
 exports.getFiles = async (req, res) => {
     try {
-        const [files] = await db.execute(
-            `SELECT 
-                f.id, f.user_id, f.original_name, f.title, f.description, 
-                f.category, f.tags, f.current_version, f.is_deleted,
-                f.created_at, f.updated_at,
-                fv.file_size, fv.mime_type 
-             FROM files f 
-             LEFT JOIN file_versions fv ON f.id = fv.file_id AND fv.version_number = f.current_version 
-             WHERE f.user_id = ? AND f.is_deleted = FALSE 
-             ORDER BY f.updated_at DESC`,
-            [req.userId]
-        );
+        await ensureDataFiles();
+        const files = await storage.readJSON('files.json');
+        const versions = await storage.readJSON('file_versions.json');
 
-        // Get version counts for each file
-        const filesWithDetails = await Promise.all(files.map(async (file) => {
-            const [versions] = await db.execute(
-                'SELECT version_number, uploaded_at, file_size, discord_message_id FROM file_versions WHERE file_id = ? ORDER BY version_number DESC',
-                [file.id]
-            );
+        const userFiles = files
+            .filter(f => f.user_id === req.userId && !f.is_deleted)
+            .sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at))
+            .map(f => {
+                const v = versions.find(v => v.file_id === f.id && v.version_number === f.current_version) || {};
+                const fileVersions = versions.filter(x => x.file_id === f.id).sort((a,b)=>b.version_number-a.version_number);
+                return {
+                    id: f.id,
+                    name: f.original_name,
+                    title: f.title || f.original_name,
+                    description: f.description || '',
+                    category: f.category || '',
+                    tags: f.tags || '',
+                    currentVersion: f.current_version,
+                    versionCount: fileVersions.length,
+                    size: v.file_size || 0,
+                    mimetype: v.mime_type || '',
+                    createdAt: f.created_at,
+                    updatedAt: f.updated_at,
+                    versions: fileVersions.map(v => ({
+                        versionNumber: v.version_number,
+                        uploadedAt: v.uploaded_at,
+                        size: v.file_size,
+                        discordMessageId: v.discord_message_id
+                    }))
+                };
+            });
 
-            return {
-                id: file.id,
-                name: file.original_name,
-                title: file.title || file.original_name,
-                description: file.description || '',
-                category: file.category || '',
-                tags: file.tags || '',
-                currentVersion: file.current_version,
-                versionCount: versions.length,
-                size: file.file_size,
-                mimetype: file.mime_type,
-                createdAt: file.created_at,
-                updatedAt: file.updated_at,
-                versions: versions.map(v => ({
-                    versionNumber: v.version_number,
-                    uploadedAt: v.uploaded_at,
-                    size: v.file_size,
-                    discordMessageId: v.discord_message_id
-                }))
-            };
-        }));
-
-        res.json(filesWithDetails);
+        res.json(userFiles);
     } catch (error) {
         console.error('Get files error:', error);
         res.status(500).json({ message: 'Error fetching files' });
@@ -227,21 +196,14 @@ exports.getFiles = async (req, res) => {
 
 exports.getFile = async (req, res) => {
     try {
-        const [files] = await db.execute(
-            `SELECT * FROM files WHERE id = ? AND user_id = ? AND is_deleted = FALSE`,
-            [req.params.fileId, req.userId]
-        );
+        await ensureDataFiles();
+        const files = await storage.readJSON('files.json');
+        const versions = await storage.readJSON('file_versions.json');
 
-        if (files.length === 0) {
-            return res.status(404).json({ message: 'File not found' });
-        }
+        const file = files.find(f => f.id === req.params.fileId && f.user_id === req.userId && !f.is_deleted);
+        if (!file) return res.status(404).json({ message: 'File not found' });
 
-        const file = files[0];
-
-        const [versions] = await db.execute(
-            `SELECT * FROM file_versions WHERE file_id = ? ORDER BY version_number DESC`,
-            [req.params.fileId]
-        );
+        const fileVersions = versions.filter(v => v.file_id === file.id).sort((a,b) => b.version_number - a.version_number);
 
         res.json({
             id: file.id,
@@ -251,7 +213,7 @@ exports.getFile = async (req, res) => {
             category: file.category,
             tags: file.tags,
             currentVersion: file.current_version,
-            versions: versions.map(v => ({
+            versions: fileVersions.map(v => ({
                 id: v.id,
                 versionNumber: v.version_number,
                 filename: v.filename,
@@ -272,312 +234,196 @@ exports.getFile = async (req, res) => {
 };
 
 exports.updateFile = async (req, res) => {
-    const connection = await db.getConnection();
-    
     try {
-        await connection.beginTransaction();
+        await ensureDataFiles();
+        if (!req.file) return res.status(400).json({ message: 'No file provided for update' });
 
-        const { fileId } = req.params;
-        
-        if (!req.file) {
-            return res.status(400).json({ message: 'No file provided for update' });
-        }
+        const files = await storage.readJSON('files.json');
+        const versions = await storage.readJSON('file_versions.json');
 
-        // Get existing file
-        const [files] = await connection.execute(
-            'SELECT * FROM files WHERE id = ? AND user_id = ? AND is_deleted = FALSE',
-            [fileId, req.userId]
-        );
+        const file = files.find(f => f.id === req.params.fileId && f.user_id === req.userId && !f.is_deleted);
+        if (!file) return res.status(404).json({ message: 'File not found' });
 
-        if (files.length === 0) {
-            return res.status(404).json({ message: 'File not found' });
-        }
-
-        const file = files[0];
         const newVersion = file.current_version + 1;
         const { originalname, filename, path: filePath, size, mimetype } = req.file;
-        
-        // Get optional metadata from request
+
         const title = req.body.title || file.title || originalname;
         const description = req.body.description || file.description || '';
         const category = req.body.category || file.category || '';
         const tags = req.body.tags || file.tags || '';
-        
-        // Get bot message data
-        const botData = {
-            botTitle: req.body.botTitle || '',
-            botSubtitle: req.body.botSubtitle || '',
-            botStatus: req.body.botStatus || '',
-            botContent: req.body.botContent || '',
-            botLinks: req.body.botLinks || '',
-            botColor: req.body.botColor || '#5865F2'
+
+        // update file record
+        file.current_version = newVersion;
+        file.original_name = originalname;
+        file.title = title;
+        file.description = description;
+        file.category = category;
+        file.tags = tags;
+        file.updated_at = now();
+
+        const versionRecord = {
+            id: storage.generateId('v_'),
+            file_id: file.id,
+            version_number: newVersion,
+            filename,
+            original_name: originalname,
+            file_path: filePath,
+            file_size: size,
+            mime_type: mimetype,
+            discord_message_id: null,
+            uploaded_at: now()
         };
+        versions.push(versionRecord);
 
-        console.log('🔄 Updating file...');
-        console.log('   File ID:', fileId);
-        console.log('   New version:', newVersion);
-        console.log('   File:', originalname);
-        console.log('   Size:', (size / 1024 / 1024).toFixed(2), 'MB');
+        await storage.writeJSON('files.json', files);
+        await storage.writeJSON('file_versions.json', versions);
 
-        // Update file record
-        await connection.execute(
-            `UPDATE files SET current_version = ?, original_name = ?, title = ?, description = ?, category = ?, tags = ? 
-             WHERE id = ?`,
-            [newVersion, originalname, title, description, category, tags, fileId]
-        );
-
-        // Insert new version
-        const [versionResult] = await connection.execute(
-            `INSERT INTO file_versions (file_id, version_number, filename, original_name, file_path, file_size, mime_type) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [fileId, newVersion, filename, originalname, filePath, size, mimetype]
-        );
-
-        // Log activity
-        await connection.execute(
-            `INSERT INTO activities (user_id, username, file_id, file_name, action, details) 
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [req.userId, req.user.username, fileId, originalname, 'update', `Updated to version ${newVersion}: ${title}`]
-        );
-
-        await connection.commit();
-
-        // Update in Discord if configured
-        if (req.user.discord_configured === 1 && req.user.discord_channel_id) {
-            console.log('📤 Updating Discord message...');
-            
-            // Get last version's Discord message ID
-            const [lastVersion] = await connection.execute(
-                'SELECT discord_message_id FROM file_versions WHERE file_id = ? AND version_number = ?',
-                [fileId, file.current_version]
-            );
-
-            const oldMessageId = lastVersion[0]?.discord_message_id;
-            
-            let result;
-            
-            // 🔥 CHECK: Bot Message Tab e kichu likhse kina
-            const hasBotMessage = botData.botTitle || botData.botContent || botData.botLinks || botData.botSubtitle || botData.botStatus;
-            
-            if (hasBotMessage) {
-                // USE PLAIN TEXT UPDATE
-                console.log('   📝 Updating as PLAIN TEXT...');
-                result = await discordBot.updatePlainTextMessage(
-                    req.user.discord_channel_id,
-                    oldMessageId,
-                    filePath,
-                    originalname,
-                    botData
-                );
-            } else {
-                // USE EMBED UPDATE
-                console.log('   📦 Updating as EMBED...');
-                result = await discordBot.updateMessageWithDetails(
-                    req.user.discord_channel_id,
-                    oldMessageId,
-                    filePath,
-                    originalname,
-                    title,
-                    description,
-                    category,
-                    tags,
-                    newVersion
-                );
-            }
-
-            if (result.success) {
-                await connection.execute(
-                    'UPDATE file_versions SET discord_message_id = ? WHERE id = ?',
-                    [result.messageId, versionResult.insertId]
-                );
-
-                await connection.execute(
-                    `INSERT INTO activities (user_id, username, file_id, file_name, action, details) 
-                     VALUES (?, ?, ?, ?, ?, ?)`,
-                    [req.userId, req.user.username, fileId, originalname, 'sync', `Version ${newVersion} synced to Discord`]
-                );
-                
-                console.log('✅ Discord message updated');
-            } else {
-                console.log('⚠️ Discord update failed:', result.error);
-            }
-        }
-
-        res.json({
-            message: 'File updated successfully',
-            file: {
-                id: fileId,
-                name: originalname,
-                title: title,
-                version: newVersion,
-                updatedAt: new Date()
-            }
+        await addActivity({
+            id: storage.generateId('a_'),
+            user_id: req.userId,
+            username: req.user?.username || 'admin',
+            file_id: file.id,
+            file_name: originalname,
+            action: 'update',
+            details: `Updated to version ${newVersion}: ${title}`,
+            created_at: now()
         });
-    } catch (error) {
-        await connection.rollback();
-        console.error('❌ Update error:', error);
-        
-        // Clean up uploaded file on error
-        if (req.file && req.file.path) {
+
+        // Sync to Discord if configured
+        const users = await storage.readJSON('users.json');
+        const user = users.find(u => u.id === req.userId) || {};
+        if (user.discord_configured && user.discord_channel_id) {
             try {
-                await fs.unlink(req.file.path);
-            } catch (e) {}
+                const lastVersion = versions.find(v => v.file_id === file.id && v.version_number === (newVersion-1));
+                const oldMessageId = lastVersion?.discord_message_id;
+
+                const botData = {
+                    botTitle: req.body.botTitle || '',
+                    botSubtitle: req.body.botSubtitle || '',
+                    botStatus: req.body.botStatus || '',
+                    botContent: req.body.botContent || '',
+                    botLinks: req.body.botLinks || '',
+                    botColor: req.body.botColor || '#5865F2'
+                };
+
+                const hasBotMessage = botData.botTitle || botData.botContent || botData.botLinks || botData.botSubtitle || botData.botStatus;
+                let result;
+                if (hasBotMessage) {
+                    result = await discordBot.updatePlainTextMessage(user.discord_channel_id, oldMessageId, filePath, originalname, botData);
+                } else {
+                    result = await discordBot.updateMessageWithDetails(user.discord_channel_id, oldMessageId, filePath, originalname, title, description, category, tags, newVersion);
+                }
+
+                if (result.success) {
+                    versionRecord.discord_message_id = result.messageId;
+                    await storage.writeJSON('file_versions.json', versions);
+
+                    await addActivity({
+                        id: storage.generateId('a_'),
+                        user_id: req.userId,
+                        username: req.user?.username || 'admin',
+                        file_id: file.id,
+                        file_name: originalname,
+                        action: 'sync',
+                        details: `Version ${newVersion} synced to Discord`,
+                        created_at: now()
+                    });
+                }
+            } catch (e) {
+                console.log('Discord update failed', e.message || e);
+            }
         }
-        
-        if (!res.headersSent) {
-            res.status(500).json({ message: 'Error updating file' });
-        }
-    } finally {
-        connection.release();
+
+        res.json({ message: 'File updated successfully', file: { id: file.id, name: originalname, title, version: newVersion, updatedAt: new Date() } });
+    } catch (error) {
+        console.error('❌ Update error:', error);
+        if (!res.headersSent) res.status(500).json({ message: 'Error updating file' });
     }
 };
 
 exports.downloadFile = async (req, res) => {
     try {
-        const { fileId, version } = req.params;
+        await ensureDataFiles();
+        const files = await storage.readJSON('files.json');
+        const versions = await storage.readJSON('file_versions.json');
 
-        // Verify file ownership
-        const [files] = await db.execute(
-            'SELECT id FROM files WHERE id = ? AND user_id = ? AND is_deleted = FALSE',
-            [fileId, req.userId]
-        );
+        const file = files.find(f => f.id === req.params.fileId && f.user_id === req.userId && !f.is_deleted);
+        if (!file) return res.status(404).json({ message: 'File not found' });
 
-        if (files.length === 0) {
-            return res.status(404).json({ message: 'File not found' });
-        }
-
-        let query = 'SELECT * FROM file_versions WHERE file_id = ?';
-        let params = [fileId];
-
-        if (version) {
-            query += ' AND version_number = ?';
-            params.push(version);
+        let fileVersion;
+        if (req.params.version) {
+            fileVersion = versions.find(v => v.file_id === file.id && String(v.version_number) === String(req.params.version));
         } else {
-            query += ' ORDER BY version_number DESC LIMIT 1';
+            fileVersion = versions.filter(v => v.file_id === file.id).sort((a,b)=>b.version_number-a.version_number)[0];
         }
 
-        const [versions] = await db.execute(query, params);
+        if (!fileVersion) return res.status(404).json({ message: 'Version not found' });
 
-        if (versions.length === 0) {
-            return res.status(404).json({ message: 'Version not found' });
-        }
-
-        const fileVersion = versions[0];
-        
-        // Check if file exists physically
         try {
             await fs.access(fileVersion.file_path, fs.constants.R_OK);
         } catch (err) {
             return res.status(404).json({ message: 'File not found on server. It may have been deleted.' });
         }
 
-        // Get file stats
         const stats = await fs.stat(fileVersion.file_path);
-        console.log('📥 Downloading:', fileVersion.original_name, `(${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-
-        // Stream the file for better performance with large files
         const fileStream = require('fs').createReadStream(fileVersion.file_path);
-        
         res.setHeader('Content-Type', fileVersion.mime_type || 'application/octet-stream');
         res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileVersion.original_name)}"`);
         res.setHeader('Content-Length', stats.size);
-        
         fileStream.pipe(res);
-        
-        fileStream.on('error', (err) => {
-            console.error('Stream error:', err);
-            if (!res.headersSent) {
-                res.status(500).json({ message: 'Error downloading file' });
-            }
-        });
-
-        fileStream.on('end', () => {
-            console.log('✅ Download complete:', fileVersion.original_name);
-        });
-
     } catch (error) {
         console.error('Download error:', error);
-        if (!res.headersSent) {
-            res.status(500).json({ message: 'Error downloading file' });
-        }
+        if (!res.headersSent) res.status(500).json({ message: 'Error downloading file' });
     }
 };
 
 exports.deleteFile = async (req, res) => {
-    const connection = await db.getConnection();
-    
     try {
-        await connection.beginTransaction();
+        await ensureDataFiles();
+        const files = await storage.readJSON('files.json');
+        const versions = await storage.readJSON('file_versions.json');
 
-        const [files] = await connection.execute(
-            'SELECT * FROM files WHERE id = ? AND user_id = ?',
-            [req.params.fileId, req.userId]
-        );
+        const idx = files.findIndex(f => f.id === req.params.fileId && f.user_id === req.userId);
+        if (idx === -1) return res.status(404).json({ message: 'File not found' });
 
-        if (files.length === 0) {
-            return res.status(404).json({ message: 'File not found' });
-        }
-
-        const file = files[0];
-
-        // Soft delete
-        await connection.execute(
-            'UPDATE files SET is_deleted = TRUE WHERE id = ?',
-            [req.params.fileId]
-        );
+        const file = files[idx];
+        file.is_deleted = true;
+        await storage.writeJSON('files.json', files);
 
         // Delete from Discord if configured
-        if (req.user.discord_configured === 1 && req.user.discord_channel_id) {
-            const [lastVersion] = await connection.execute(
-                'SELECT discord_message_id FROM file_versions WHERE file_id = ? ORDER BY version_number DESC LIMIT 1',
-                [req.params.fileId]
-            );
-            
-            if (lastVersion[0]?.discord_message_id) {
-                await discordBot.deleteMessage(
-                    req.user.discord_channel_id,
-                    lastVersion[0].discord_message_id
-                );
-                console.log('🗑️ Discord message deleted');
+        const users = await storage.readJSON('users.json');
+        const user = users.find(u => u.id === req.userId) || {};
+        if (user.discord_configured && user.discord_channel_id) {
+            const fileVersions = versions.filter(v => v.file_id === file.id).sort((a,b)=>b.version_number-a.version_number);
+            const lastVersion = fileVersions[0];
+            if (lastVersion?.discord_message_id) {
+                try {
+                    await discordBot.deleteMessage(user.discord_channel_id, lastVersion.discord_message_id);
+                } catch (e) { console.log('Discord delete failed', e.message || e); }
             }
         }
 
         // Delete physical files
-        const [versions] = await connection.execute(
-            'SELECT file_path FROM file_versions WHERE file_id = ?',
-            [req.params.fileId]
-        );
-
-        for (const v of versions) {
-            try {
-                await fs.unlink(v.file_path);
-                console.log('🧹 Deleted:', v.file_path);
-            } catch (err) {
-                console.log('File already deleted or not found:', v.file_path);
-            }
+        const fileVersions = versions.filter(v => v.file_id === file.id);
+        for (const v of fileVersions) {
+            try { await fs.unlink(v.file_path); } catch (e) { }
         }
 
-        // Log activity
-        await connection.execute(
-            `INSERT INTO activities (user_id, username, file_id, file_name, action, details) 
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [req.userId, req.user.username, req.params.fileId, file.original_name, 'delete', `File deleted: ${file.title || file.original_name}`]
-        );
-
-        await connection.commit();
-        
-        console.log('✅ File deleted:', file.original_name);
-
-        res.json({ 
-            message: 'File deleted successfully',
-            fileName: file.original_name
+        await addActivity({
+            id: storage.generateId('a_'),
+            user_id: req.userId,
+            username: req.user?.username || 'admin',
+            file_id: file.id,
+            file_name: file.original_name,
+            action: 'delete',
+            details: `File deleted: ${file.title || file.original_name}`,
+            created_at: now()
         });
+
+        res.json({ message: 'File deleted successfully', fileName: file.original_name });
     } catch (error) {
-        await connection.rollback();
         console.error('Delete error:', error);
         res.status(500).json({ message: 'Error deleting file' });
-    } finally {
-        connection.release();
     }
 };
 
