@@ -18,16 +18,34 @@ if (!fs.existsSync(uploadDir)) {
     console.log('✅ Uploads directory created');
 }
 
+// ===== CORS Configuration =====
+const allowedOrigins = [
+    'https://nexoracheats.infinityfree.me', // আপনার ফ্রন্টএন্ড ডোমেইন
+    'http://localhost:3000',               // লোকাল ডেভেলপমেন্টের জন্য
+    'http://127.0.0.1:3000'
+];
+
+app.use(cors({
+    origin: function (origin, callback) {
+        // allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) === -1) {
+            const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+            return callback(new Error(msg), false);
+        }
+        return callback(null, true);
+    },
+    credentials: true
+}));
+
 // ===== IMPORTANT: INCREASE TIMEOUT FOR LARGE FILES =====
 app.use((req, res, next) => {
-    // Set timeout to 10 minutes for large uploads
     req.setTimeout(600000); // 10 minutes
     res.setTimeout(600000); // 10 minutes
     next();
 });
 
 // Middleware with increased limits
-app.use(cors());
 app.use(express.json({ limit: '500mb' }));
 app.use(express.urlencoded({ limit: '500mb', extended: true, parameterLimit: 50000 }));
 
@@ -71,14 +89,14 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-    console.log(`✅ Server running on http://localhost:${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', () => { // Render-এর জন্য '0.0.0.0' জরুরি
+    console.log(`✅ Server running on port ${PORT}`);
     console.log(`📁 Upload directory: ${uploadDir}`);
     console.log(`📦 Max file size: 500MB`);
     console.log(`⏱️  Timeout: 10 minutes`);
 });
 
 // Increase server timeout
-server.timeout = 600000; // 10 minutes
-server.keepAliveTimeout = 650000; // Slightly more than timeout
-server.headersTimeout = 660000; // Slightly more than keepAlive
+server.timeout = 600000; 
+server.keepAliveTimeout = 650000; 
+server.headersTimeout = 660000;
