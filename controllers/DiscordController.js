@@ -1,4 +1,4 @@
-const db = require('../database/db');
+const storage = require('../storage');
 const discordBot = require('../services/DiscordBot');
 
 exports.configureDiscord = async (req, res) => {
@@ -23,11 +23,16 @@ exports.configureDiscord = async (req, res) => {
             return res.status(400).json({ message: channelTest.error });
         }
 
-        // Save to database
-        await db.execute(
-            'UPDATE users SET discord_channel_id = ?, discord_configured = TRUE WHERE id = ?',
-            [channelId, req.userId]
-        );
+        // Save to local JSON store
+        const users = await storage.readJSON('users.json');
+        const idx = users.findIndex(u => u.id === req.userId);
+        if (idx === -1) {
+            users.push({ id: req.userId, username: req.user?.username || 'admin', discord_configured: true, discord_channel_id: channelId });
+        } else {
+            users[idx].discord_configured = true;
+            users[idx].discord_channel_id = channelId;
+        }
+        await storage.writeJSON('users.json', users);
 
         res.json({
             message: 'Discord connected successfully',
@@ -62,15 +67,13 @@ exports.testChannel = async (req, res) => {
 
 exports.getDiscordStatus = async (req, res) => {
     try {
-        const [users] = await db.execute(
-            'SELECT discord_configured, discord_channel_id FROM users WHERE id = ?',
-            [req.userId]
-        );
+        const users = await storage.readJSON('users.json');
+        const user = users.find(u => u.id === req.userId) || {};
 
         res.json({
-            configured: users[0].discord_configured === 1,
-            channelId: users[0].discord_channel_id,
-            botConnected: discordBot.isConnected
+            configured: !!user.discord_configured,
+            channelId: user.discord_channel_id || null,
+            botConnected: !!discordBot.isConnected
         });
     } catch (error) {
         res.status(500).json({ message: 'Error getting status' });
@@ -81,10 +84,14 @@ exports.disconnectDiscord = async (req, res) => {
     try {
         await discordBot.disconnect();
         
-        await db.execute(
-            'UPDATE users SET discord_channel_id = NULL, discord_configured = FALSE WHERE id = ?',
-            [req.userId]
-        );
+        // Remove from local JSON store
+        const users = await storage.readJSON('users.json');
+        const idx = users.findIndex(u => u.id === req.userId);
+        if (idx !== -1) {
+            users[idx].discord_configured = false;
+            users[idx].discord_channel_id = null;
+            await storage.writeJSON('users.json', users);
+        }
 
         res.json({ message: 'Discord disconnected' });
     } catch (error) {
